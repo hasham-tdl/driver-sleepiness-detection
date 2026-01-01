@@ -1,6 +1,6 @@
 # **Driver Sleepiness Detection App 😴🚗**
 
-A real-time desktop app to detect driver sleepiness and yawning using facial landmarks, powered by OpenCV, Dlib, and Kivy.
+A real-time desktop app to detect driver sleepiness and yawning using facial landmarks, powered by OpenCV, Dlib, and Kivy. Currently using only mp4 to detect faces. WORK IN PROGRESS
 
 ---
 
