@@ -51,16 +51,21 @@ class DriverSleepinessVideoApp(App):
     def build(self):
         self.capture = None
         self.video_path = None
+        self.use_webcam = False
 
         # ---- MODELS ----
         self.detector = dlib.get_frontal_face_detector()
         self.predictor = dlib.shape_predictor(predictor_path)
 
         # ---- THRESHOLDS ----
-        self.EYE_THRESH = 0.21
-        self.MAR_THRESH = 0.75
-        self.SLEEP_TIME = 2.0
-        self.YAWN_TIME = 1.5
+        self.EYE_THRESH = 0.24
+        self.MAR_THRESH = 0.70
+        self.SLEEP_TIME = 1.2
+        self.YAWN_TIME = 1.0
+
+        # ---- UNCONSCIOUSNESS ----
+        self.UNCONSCIOUS_EAR = 0.18
+        self.HEAD_TILT_THRESH = 15
 
         # ---- STATE ----
         self.state = None
@@ -68,8 +73,19 @@ class DriverSleepinessVideoApp(App):
         self.yawn_start = None
         self.alarm_played = False
 
+        # ---- TIMERS ----
+        self.last_face_time = time.time()
+        self.FACE_LOST_TIMEOUT = 0.5
+        self.last_alarm_time = 0
+        self.ALARM_COOLDOWN = 5
+
+        # ---- SMOOTHING ----
+        self.ear_history = deque(maxlen=5)
+        self.mar_history = deque(maxlen=5)
+
         # ---- PERCLOS ----
-        self.perclos = deque(maxlen=1800)
+        self.perclos = deque(maxlen=900)
+        self.PERCLOS_THRESH = 0.25
 
         # ---- LANDMARK IDS ----
         (self.lStart, self.lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
@@ -83,18 +99,21 @@ class DriverSleepinessVideoApp(App):
 
         controls = BoxLayout(size_hint_y=None, height=50)
         load_btn = Button(text="Load Video")
+        webcam_btn = Button(text="Use Webcam")
         play_btn = Button(text="Play")
         stop_btn = Button(text="Stop")
 
         load_btn.bind(on_press=self.open_file_chooser)
+        webcam_btn.bind(on_press=self.start_webcam)
         play_btn.bind(on_press=self.start)
         stop_btn.bind(on_press=self.stop)
 
         controls.add_widget(load_btn)
+        controls.add_widget(webcam_btn)
         controls.add_widget(play_btn)
         controls.add_widget(stop_btn)
-        layout.add_widget(controls)
 
+        layout.add_widget(controls)
         return layout
 
     # ---------------- FILE CHOOSER ----------------
@@ -111,15 +130,34 @@ class DriverSleepinessVideoApp(App):
         def select(_):
             if chooser.selection:
                 self.video_path = chooser.selection[0]
+                self.use_webcam = False
                 popup.dismiss()
 
         btn.bind(on_press=select)
         popup.open()
 
+    # ---------------- WEBCAM ----------------
+    def start_webcam(self, _):
+        self.stop(None)
+        self.use_webcam = True
+
+        for idx in range(5):
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                self.capture = cap
+                break
+
+        if not self.capture:
+            print("❌ Webcam not detected")
+            return
+
+        Clock.schedule_interval(self.update, 1 / 30)
+
     # ---------------- CONTROLS ----------------
     def start(self, _):
-        if not self.video_path:
+        if self.use_webcam or not self.video_path:
             return
+        self.stop(None)
         self.capture = cv2.VideoCapture(self.video_path)
         Clock.schedule_interval(self.update, 1 / 30)
 
@@ -134,78 +172,119 @@ class DriverSleepinessVideoApp(App):
     def update(self, dt):
         ret, frame = self.capture.read()
         if not ret:
-            self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            if not self.use_webcam:
+                self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
             return
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.createCLAHE(2.0, (8, 8)).apply(gray)
 
-        faces = self.detector(gray, 0)
         now = time.time()
+        faces = self.detector(gray, 1)
 
-        # ---- NO FACE → NO STATE ----
         if len(faces) == 0:
-            self.state = None
-            self.eyes_closed_start = None
-            self.yawn_start = None
-            self.perclos.clear()
-            self.alarm_played = False
+            if now - self.last_face_time > self.FACE_LOST_TIMEOUT:
+                self.state = None
+                self.eyes_closed_start = None
+                self.yawn_start = None
+                self.perclos.clear()
+                self.alarm_played = False
+            self.render(gray)
+            return
+
+        self.last_face_time = now
+
+        # ---- DRIVER FACE (largest) ----
+        faces = sorted(
+            faces,
+            key=lambda f: (f.right() - f.left()) * (f.bottom() - f.top()),
+            reverse=True
+        )
+        face = faces[0]
+
+        shape = face_utils.shape_to_np(self.predictor(gray, face))
+
+        # ---- EAR (one-eye supported) ----
+        ear_values = []
+        left_eye = shape[self.lStart:self.lEnd]
+        right_eye = shape[self.rStart:self.rEnd]
+
+        if np.linalg.norm(left_eye[0] - left_eye[3]) > 1:
+            ear_values.append(eye_aspect_ratio(left_eye))
+        if np.linalg.norm(right_eye[0] - right_eye[3]) > 1:
+            ear_values.append(eye_aspect_ratio(right_eye))
+
+        if not ear_values:
+            self.render(gray)
+            return
+
+        ear = min(ear_values)
+        self.ear_history.append(ear)
+        ear = sum(self.ear_history) / len(self.ear_history)
+
+        self.perclos.append(1 if ear < self.EYE_THRESH else 0)
+
+        if ear < self.EYE_THRESH:
+            if self.eyes_closed_start is None:
+                self.eyes_closed_start = now
         else:
-            for face in faces:
-                shape = face_utils.shape_to_np(self.predictor(gray, face))
+            self.eyes_closed_start = None
 
-                ear = (
-                    eye_aspect_ratio(shape[self.lStart:self.lEnd]) +
-                    eye_aspect_ratio(shape[self.rStart:self.rEnd])
-                ) / 2.0
+        mar = mouth_aspect_ratio(shape[self.mStart:self.mEnd])
+        self.mar_history.append(mar)
+        mar = sum(self.mar_history) / len(self.mar_history)
 
-                self.perclos.append(1 if ear < self.EYE_THRESH else 0)
+        if mar > self.MAR_THRESH:
+            if self.yawn_start is None:
+                self.yawn_start = now
+        else:
+            self.yawn_start = None
 
-                if ear < self.EYE_THRESH:
-                    if self.eyes_closed_start is None:
-                        self.eyes_closed_start = now
-                else:
-                    self.eyes_closed_start = None
+        perclos_rate = sum(self.perclos) / len(self.perclos)
+        yawning = self.yawn_start and (now - self.yawn_start) > self.YAWN_TIME
 
-                mar = mouth_aspect_ratio(shape[self.mStart:self.mEnd])
+        # ---- HEAD TILT ----
+        nose = shape[33]
+        chin = shape[8]
+        angle = np.degrees(np.arctan2(chin[1] - nose[1], chin[0] - nose[0]))
 
-                if mar > self.MAR_THRESH:
-                    if self.yawn_start is None:
-                        self.yawn_start = now
-                else:
-                    self.yawn_start = None
+        unconscious = ear < self.UNCONSCIOUS_EAR and abs(angle) > self.HEAD_TILT_THRESH
 
-                perclos_rate = sum(self.perclos) / max(len(self.perclos), 1)
-                yawning = self.yawn_start and (now - self.yawn_start) > self.YAWN_TIME
+        if unconscious or (self.eyes_closed_start and (now - self.eyes_closed_start) > self.SLEEP_TIME):
+            self.state = "SLEEPING"
+        elif yawning or perclos_rate > self.PERCLOS_THRESH:
+            self.state = "DROWSY"
+        else:
+            self.state = "AWAKE"
 
-                if self.eyes_closed_start and (now - self.eyes_closed_start) > self.SLEEP_TIME:
-                    self.state = "SLEEPING"
-                elif yawning or perclos_rate > 0.4:
-                    self.state = "DROWSY"
-                else:
-                    self.state = "AWAKE"
+        # ---- DRAW ----
+        x1, y1, x2, y2 = face.left(), face.top(), face.right(), face.bottom()
+        cv2.rectangle(gray, (x1, y1), (x2, y2), 255, 2)
 
-                x1, y1, x2, y2 = face.left(), face.top(), face.right(), face.bottom()
-                cv2.rectangle(gray, (x1, y1), (x2, y2), 255, 2)
-                break
+        cv2.putText(gray, f"EAR: {ear:.2f}", (30, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, 255, 2)
+        cv2.putText(gray, f"PERCLOS: {perclos_rate:.2f}", (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, 255, 2)
 
-        # ---- DISPLAY STATE ONLY IF FACE EXISTS ----
         if self.state == "DROWSY":
-            cv2.putText(gray, "DROWSY", (30, 80),
+            cv2.putText(gray, "DROWSY", (30, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, 255, 4)
 
         elif self.state == "SLEEPING":
-            cv2.putText(gray, "⚠ SLEEPING", (30, 130),
+            cv2.putText(gray, "⚠ SLEEPING", (30, 140),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.8, 255, 5)
-            if not self.alarm_played:
+
+            if not self.alarm_played and (now - self.last_alarm_time) > self.ALARM_COOLDOWN:
                 AlarmThread(alarm_path).start()
                 self.alarm_played = True
+                self.last_alarm_time = now
 
+        self.render(gray)
+
+    # ---------------- RENDER ----------------
+    def render(self, gray):
         gray = cv2.flip(gray, 0)
-        texture = Texture.create(
-            size=(gray.shape[1], gray.shape[0]),
-            colorfmt="luminance"
-        )
+        texture = Texture.create(size=(gray.shape[1], gray.shape[0]), colorfmt="luminance")
         texture.blit_buffer(gray.tobytes(), colorfmt="luminance", bufferfmt="ubyte")
         self.image.texture = texture
 
